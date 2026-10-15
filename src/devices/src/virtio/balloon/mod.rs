@@ -25,6 +25,8 @@ mod defs {
 pub enum BalloonError {
     /// Failed to create event fd.
     EventFd(std::io::Error),
+    /// Failed to start a worker thread.
+    Worker(std::io::Error),
 }
 
 type Result<T> = std::result::Result<T, BalloonError>;

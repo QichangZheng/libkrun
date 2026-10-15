@@ -142,6 +142,14 @@ impl<'a> AttachContext<'a> {
         &self.vmm.guest_memory
     }
 
+    /// The guest physical address range [start, end) of the VM's RAM. It
+    /// doesn't include the firmware region or SHM windows.
+    #[cfg(target_arch = "aarch64")]
+    pub fn ram_range(&self) -> (u64, u64) {
+        let info = &self.vmm.arch_memory_info;
+        (info.ram_start_addr, info.ram_last_addr)
+    }
+
     /// The resolved SHM region for the current device index, if one was
     /// allocated based on [`DeviceRequirements::shm_size`].
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -1125,6 +1133,15 @@ impl BalloonDevice {
 impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let (start, end) = ctx.ram_range();
+            self.inner
+                .lock()
+                .unwrap()
+                .enable_reclaim(start, end)
+                .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+        }
         ctx.subscribe_events(self.inner.clone())?;
         ctx.register("balloon", self.inner)
     }

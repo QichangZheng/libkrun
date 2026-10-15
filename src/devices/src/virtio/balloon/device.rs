@@ -1,7 +1,15 @@
 use std::cmp;
-#[cfg(not(target_os = "windows"))]
-use std::convert::TryInto;
+#[cfg(target_os = "macos")]
+use std::io;
 use std::io::Write;
+#[cfg(target_os = "macos")]
+use std::mem;
+#[cfg(target_os = "macos")]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(target_os = "macos")]
+use std::sync::{Arc, Mutex, mpsc};
+#[cfg(target_os = "macos")]
+use std::thread;
 
 use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
@@ -56,6 +64,35 @@ pub struct Balloon {
     pub(crate) device_state: DeviceState,
     config: VirtioBalloonConfig,
     bad_reports: u64,
+    #[cfg(target_os = "macos")]
+    reclaimer: Option<Reclaimer>,
+}
+
+/// Reports shorter than this are only madvise()d, so that the guest can't make
+/// us split the stage-2 mapping of its RAM into many small pieces. Linux
+/// reports 2 MiB blocks by default, but page_reporting_order can be lowered.
+#[cfg(target_os = "macos")]
+const RECLAIM_MIN_LEN: u64 = 2 << 20;
+
+/// Gives free page reports back to the host with hvf::reclaim_guest_ram(), on a
+/// worker thread because that may block. A report is added to the used ring
+/// only once the worker is done with it: until then the guest doesn't touch
+/// the reported pages, so it never finds them unmapped.
+#[cfg(target_os = "macos")]
+struct Reclaimer {
+    /// Guest RAM range [start, end) that may be reclaimed.
+    ram: (u64, u64),
+    jobs: mpsc::Sender<ReclaimJob>,
+    /// Heads of the descriptor chains the worker is done with.
+    done: Arc<Mutex<Vec<u16>>>,
+    done_evt: EventFd,
+}
+
+#[cfg(target_os = "macos")]
+struct ReclaimJob {
+    head: u16,
+    /// (guest address, host address, length)
+    ranges: Vec<(u64, u64, u64)>,
 }
 
 /// Host address of a free page report, if the whole range [addr, addr + len)
@@ -80,7 +117,70 @@ impl Balloon {
             device_state: DeviceState::Inactive,
             config: VirtioBalloonConfig::default(),
             bad_reports: 0,
+            #[cfg(target_os = "macos")]
+            reclaimer: None,
         })
+    }
+
+    /// Give free page reports of at least 2 MiB inside the guest RAM range
+    /// [start, end) back to the host by remapping them, instead of
+    /// madvise()ing them, which doesn't free any page the guest has written
+    /// to. The range must not include the firmware region or SHM windows.
+    #[cfg(target_os = "macos")]
+    pub fn enable_reclaim(&mut self, start: u64, end: u64) -> super::Result<()> {
+        let done_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(BalloonError::EventFd)?;
+        let worker_evt = done_evt.try_clone().map_err(BalloonError::EventFd)?;
+        let (jobs, job_rx) = mpsc::channel();
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let worker_done = done.clone();
+        thread::Builder::new()
+            .name("balloon reclaim".into())
+            .spawn(move || reclaim_worker(job_rx, worker_done, worker_evt))
+            .map_err(BalloonError::Worker)?;
+
+        hvf::set_reclaim_ram_range(start, end);
+        self.reclaimer = Some(Reclaimer {
+            ram: (start, end),
+            jobs,
+            done,
+            done_evt,
+        });
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn reclaim_done_fd(&self) -> Option<RawFd> {
+        self.reclaimer.as_ref().map(|r| r.done_evt.as_raw_fd())
+    }
+
+    /// Adds the reports the reclaim worker is done with to the used ring.
+    /// Returns true if there were any.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn complete_reclaimed(&mut self) -> bool {
+        let Some(r) = self.reclaimer.as_ref() else {
+            return false;
+        };
+        if let Err(e) = r.done_evt.read()
+            && e.kind() != io::ErrorKind::WouldBlock
+        {
+            error!("balloon: failed to read reclaim event: {e:?}");
+        }
+        let heads = mem::take(&mut *r.done.lock().unwrap());
+
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem, _) => mem,
+            DeviceState::Inactive => unreachable!(),
+        };
+        let queues = self
+            .queues
+            .as_mut()
+            .expect("queues should exist when activated");
+        for &head in &heads {
+            if let Err(e) = queues[FRQ_INDEX].queue.add_used(mem, head, 0) {
+                error!("failed to add used elements to the queue: {e:?}");
+            }
+        }
+        !heads.is_empty()
     }
 
     pub fn id(&self) -> &str {
@@ -103,8 +203,11 @@ impl Balloon {
 
         while let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
             let index = head.index;
+            #[cfg(target_os = "macos")]
+            let mut reclaim = Vec::new();
             for desc in head.into_iter() {
-                let Some(host_addr) = report_host_addr(mem, desc.addr, desc.len as u64) else {
+                let len = desc.len as u64;
+                let Some(host_addr) = report_host_addr(mem, desc.addr, len) else {
                     // Releasing a range that goes past the end of guest memory
                     // would discard whatever the VMM has mapped next to it.
                     self.bad_reports += 1;
@@ -121,22 +224,36 @@ impl Balloon {
                     "balloon: should release guest_addr={:?} host_addr={:p} len={}",
                     desc.addr, host_addr, desc.len
                 );
-                #[cfg(target_os = "linux")]
-                let advice = libc::MADV_DONTNEED;
                 #[cfg(target_os = "macos")]
-                let advice = libc::MADV_FREE;
-                #[cfg(unix)]
-                unsafe {
-                    libc::madvise(
-                        host_addr as *mut libc::c_void,
-                        desc.len.try_into().unwrap(),
-                        advice,
-                    )
-                };
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    DiscardVirtualMemory(host_addr as *mut core::ffi::c_void, desc.len as usize)
-                };
+                if let Some(r) = &self.reclaimer
+                    && len >= RECLAIM_MIN_LEN
+                    && desc.addr.0 >= r.ram.0
+                    && desc.addr.0 + len <= r.ram.1
+                {
+                    reclaim.push((desc.addr.0, host_addr as u64, len));
+                    continue;
+                }
+                // SAFETY: the range is guest memory, which the guest no longer uses.
+                unsafe { discard(host_addr, desc.len as usize) };
+            }
+
+            #[cfg(target_os = "macos")]
+            if !reclaim.is_empty()
+                && let Some(r) = &self.reclaimer
+            {
+                match r.jobs.send(ReclaimJob {
+                    head: index,
+                    ranges: reclaim,
+                }) {
+                    Ok(()) => continue,
+                    Err(mpsc::SendError(job)) => {
+                        error!("balloon: reclaim worker is gone, using madvise()");
+                        for (_, host_addr, len) in job.ranges {
+                            // SAFETY: as above.
+                            unsafe { discard(host_addr as *mut u8, len as usize) };
+                        }
+                    }
+                }
             }
 
             have_used = true;
@@ -146,6 +263,57 @@ impl Balloon {
         }
 
         have_used
+    }
+}
+
+/// Lets the host drop the pages backing a free page report.
+///
+/// # Safety
+///
+/// The range must be guest memory whose contents the guest doesn't need.
+unsafe fn discard(host_addr: *mut u8, len: usize) {
+    #[cfg(target_os = "linux")]
+    let advice = libc::MADV_DONTNEED;
+    #[cfg(target_os = "macos")]
+    let advice = libc::MADV_FREE;
+    #[cfg(unix)]
+    unsafe {
+        libc::madvise(host_addr as *mut libc::c_void, len, advice)
+    };
+    #[cfg(target_os = "windows")]
+    unsafe {
+        DiscardVirtualMemory(host_addr as *mut core::ffi::c_void, len)
+    };
+}
+
+#[cfg(target_os = "macos")]
+fn reclaim_worker(jobs: mpsc::Receiver<ReclaimJob>, done: Arc<Mutex<Vec<u16>>>, done_evt: EventFd) {
+    let mut fallbacks: u64 = 0;
+    for job in jobs {
+        for (guest_addr, host_addr, len) in job.ranges {
+            // SAFETY: process_frq() checked that the range is guest RAM, and the
+            // guest doesn't touch it until the report is in the used ring.
+            let result = unsafe { hvf::reclaim_guest_ram(host_addr, guest_addr, len) };
+            if let Ok(released) = result
+                && released > 0
+            {
+                debug!("balloon: reclaimed guest_addr=0x{guest_addr:x} len={released}");
+                continue;
+            }
+            fallbacks += 1;
+            if fallbacks.is_power_of_two() {
+                warn!(
+                    "balloon: could not remap guest_addr=0x{guest_addr:x} len={len} ({result:?}), \
+                     using madvise() ({fallbacks} so far)"
+                );
+            }
+            // SAFETY: as above.
+            unsafe { discard(host_addr as *mut u8, len as usize) };
+        }
+        done.lock().unwrap().push(job.head);
+        if let Err(e) = done_evt.write(1) {
+            error!("balloon: failed to signal reclaim completion: {e:?}");
+        }
     }
 }
 
