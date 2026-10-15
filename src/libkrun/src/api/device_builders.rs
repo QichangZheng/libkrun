@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::env;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use std::ffi::CString;
 use std::io::IsTerminal;
@@ -1114,6 +1116,11 @@ impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
 #[cfg(not(feature = "tee"))]
 pub struct BalloonDevice {
     pub(crate) inner: Arc<Mutex<devices::virtio::Balloon>>,
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    free_page_reclaim: bool,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
@@ -1124,7 +1131,21 @@ impl BalloonDevice {
             .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(balloon)),
+            free_page_reclaim: true,
         })
+    }
+
+    /// Set whether memory that the guest reports as free (free page reporting)
+    /// is returned to the host. Enabled by default.
+    ///
+    /// On macOS, madvise() doesn't release guest memory that the guest has
+    /// written to, so the device replaces the reported pages with fresh memory
+    /// instead, on a separate thread, at the cost of a few system calls per
+    /// report. When disabled, or if the environment variable KRUN_BALLOON_REMAP
+    /// is set to 0, it only calls madvise(). Other platforms always release the
+    /// reported pages and ignore this setting.
+    pub fn set_free_page_reclaim(&mut self, enabled: bool) {
+        self.free_page_reclaim = enabled;
     }
 }
 
@@ -1134,7 +1155,7 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
+        if self.free_page_reclaim && env::var_os("KRUN_BALLOON_REMAP").is_none_or(|v| v != "0") {
             let (start, end) = ctx.ram_range();
             self.inner
                 .lock()
