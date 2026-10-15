@@ -22,6 +22,7 @@ use std::cell::Cell;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -101,6 +102,7 @@ const EC_AA64_HVC: u64 = 0x16;
 const EC_AA64_SMC: u64 = 0x17;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const EC_SYSTEMREGISTERTRAP: u64 = 0x18;
+const EC_INSTRABORT: u64 = 0x20;
 const EC_DATAABORT: u64 = 0x24;
 const EC_AA64_BKPT: u64 = 0x3c;
 
@@ -305,6 +307,7 @@ impl HvfVm {
         if ret != HV_SUCCESS {
             Err(Error::VmCreate)
         } else {
+            set_reclaim_ram_range(0, 0);
             Ok(Self {})
         }
     }
@@ -338,6 +341,25 @@ impl HvfVm {
             Ok(())
         }
     }
+}
+
+static RECLAIM_RAM_START: AtomicU64 = AtomicU64::new(0);
+static RECLAIM_RAM_END: AtomicU64 = AtomicU64::new(0);
+
+/// Declares the guest RAM range [start, end) that [`reclaim_guest_ram`] may be
+/// used on. Must be called before the vCPUs start.
+///
+/// Guest RAM is otherwise always mapped, so a stage-2 abort in this range means
+/// that the guest accessed memory while it was being reclaimed. The vCPU then
+/// stops the VM instead of emulating the access as MMIO, which would silently
+/// corrupt guest memory.
+pub fn set_reclaim_ram_range(start: u64, end: u64) {
+    RECLAIM_RAM_START.store(start, Ordering::Relaxed);
+    RECLAIM_RAM_END.store(end, Ordering::Release);
+}
+
+fn in_reclaim_ram(pa: u64) -> bool {
+    pa < RECLAIM_RAM_END.load(Ordering::Acquire) && pa >= RECLAIM_RAM_START.load(Ordering::Relaxed)
 }
 
 fn guest_memory_flags() -> hv_memory_flags_t {
@@ -854,6 +876,14 @@ impl HvfVcpu<'_> {
                 );
 
                 let pa = self.vcpu_exit.exception.physical_address;
+                if in_reclaim_ram(pa) {
+                    error!(
+                        "vcpu[{}]: stage-2 data abort on guest RAM 0x{pa:x} while it was being \
+                         reclaimed, stopping the VM",
+                        self.vcpuid
+                    );
+                    return Ok(VcpuExit::Shutdown);
+                }
                 self.pending_advance_pc = true;
 
                 if iswrite {
@@ -959,6 +989,14 @@ impl HvfVcpu<'_> {
             EC_AA64_SMC => {
                 self.pending_advance_pc = true;
                 self.handle_psci_request()
+            }
+            EC_INSTRABORT if in_reclaim_ram(self.vcpu_exit.exception.physical_address) => {
+                error!(
+                    "vcpu[{}]: stage-2 instruction abort on guest RAM 0x{:x} while it was being \
+                     reclaimed, stopping the VM",
+                    self.vcpuid, self.vcpu_exit.exception.physical_address
+                );
+                Ok(VcpuExit::Shutdown)
             }
             _ => panic!("unexpected exception: 0x{ec:x}"),
         }
