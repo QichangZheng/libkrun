@@ -4,7 +4,7 @@ use std::convert::TryInto;
 use std::io::Write;
 
 use utils::eventfd::EventFd;
-use vm_memory::{ByteValued, GuestMemoryBackend, GuestMemoryMmap};
+use vm_memory::{ByteValued, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 
 use super::super::{
     ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, QueueConfig,
@@ -55,6 +55,18 @@ pub struct Balloon {
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
     config: VirtioBalloonConfig,
+    bad_reports: u64,
+}
+
+/// Host address of a free page report, if the whole range [addr, addr + len)
+/// lies within one guest memory region. Both values come from the guest.
+fn report_host_addr(mem: &GuestMemoryMmap, addr: GuestAddress, len: u64) -> Option<*mut u8> {
+    let region = mem.find_region(addr)?;
+    let last = addr.0.checked_add(len.checked_sub(1)?)?;
+    if last > region.last_addr().0 {
+        return None;
+    }
+    mem.get_host_address(addr).ok()
 }
 
 impl Balloon {
@@ -67,6 +79,7 @@ impl Balloon {
                 .map_err(BalloonError::EventFd)?,
             device_state: DeviceState::Inactive,
             config: VirtioBalloonConfig::default(),
+            bad_reports: 0,
         })
     }
 
@@ -91,7 +104,19 @@ impl Balloon {
         while let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
             let index = head.index;
             for desc in head.into_iter() {
-                let host_addr = mem.get_host_address(desc.addr).unwrap();
+                let Some(host_addr) = report_host_addr(mem, desc.addr, desc.len as u64) else {
+                    // Releasing a range that goes past the end of guest memory
+                    // would discard whatever the VMM has mapped next to it.
+                    self.bad_reports += 1;
+                    if self.bad_reports.is_power_of_two() {
+                        warn!(
+                            "balloon: ignoring free page report outside guest memory: \
+                             guest_addr={:?} len={} ({} so far)",
+                            desc.addr, desc.len, self.bad_reports
+                        );
+                    }
+                    continue;
+                };
                 debug!(
                     "balloon: should release guest_addr={:?} host_addr={:p} len={}",
                     desc.addr, host_addr, desc.len
@@ -199,5 +224,26 @@ impl VirtioDevice for Balloon {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_report_host_addr() {
+        let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x10000), 0x40000)]).unwrap();
+        let base = mem.get_host_address(GuestAddress(0x10000)).unwrap();
+        let check = |addr, len| report_host_addr(&mem, GuestAddress(addr), len);
+
+        assert_eq!(check(0x10000, 0x40000), Some(base));
+        assert_eq!(check(0x40000, 0x10000), Some(base.wrapping_add(0x30000)));
+
+        assert_eq!(check(0x40000, 0x10001), None);
+        assert_eq!(check(0x10000, u32::MAX as u64), None);
+        assert_eq!(check(0x0, 0x1000), None);
+        assert_eq!(check(0x10000, 0), None);
+        assert_eq!(check(u64::MAX, 2), None);
     }
 }
