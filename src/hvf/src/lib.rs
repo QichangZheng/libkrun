@@ -320,7 +320,7 @@ impl HvfVm {
                 host_start_addr as *mut core::ffi::c_void,
                 guest_start_addr,
                 size.try_into().unwrap(),
-                (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
+                guest_memory_flags(),
             )
         };
         if ret != HV_SUCCESS {
@@ -338,6 +338,130 @@ impl HvfVm {
             Ok(())
         }
     }
+}
+
+fn guest_memory_flags() -> hv_memory_flags_t {
+    (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into()
+}
+
+/// Why [`reclaim_guest_ram`] left a range untouched (still mapped, with its
+/// contents unchanged).
+#[derive(Debug)]
+pub enum ReclaimError {
+    /// Less than one host page is left after aligning the range inward.
+    TooSmall,
+    /// The host and guest addresses are not congruent modulo the host page
+    /// size.
+    Misaligned,
+    /// hv_vm_unmap() failed.
+    Unmap(hv_return_t),
+}
+
+/// Returns the host pages backing a range of guest RAM to macOS.
+///
+/// madvise(MADV_FREE) and madvise(MADV_FREE_REUSABLE) on guest RAM have no
+/// effect on pages that only the guest has written to (through stage-2): the
+/// calls succeed, but neither the process' physical footprint nor the system's
+/// free page count change. Replacing the backing pages does release them:
+///
+/// 1. hv_vm_unmap() the range.
+/// 2. mmap(MAP_FIXED) fresh anonymous memory over it, freeing the old pages.
+/// 3. hv_vm_map() it back with the same permissions.
+///
+/// The range then reads as zeroes and is populated again on first access, as
+/// after MADV_DONTNEED on Linux. It is shrunk inward to host page boundaries.
+/// Returns the number of bytes released, which is 0 if mmap() kept failing and
+/// the original pages were mapped back instead.
+///
+/// Once step 1 has succeeded, this does not return before the range is mapped
+/// again: steps 2 and 3 are retried, with a growing delay, up to once per
+/// second. It can therefore block for a long time and must not be called from
+/// the VMM event loop.
+///
+/// # Safety
+///
+/// `host_addr` must be the host address of `guest_addr`, and the whole range
+/// must be ordinary guest RAM: anonymous private memory mapped into the guest
+/// by [`HvfVm::map_memory`], not the firmware region or a DAX/GPU window, whose
+/// contents would be lost. Neither the guest nor the VMM may access the range
+/// until this returns.
+pub unsafe fn reclaim_guest_ram(
+    host_addr: u64,
+    guest_addr: u64,
+    len: u64,
+) -> Result<u64, ReclaimError> {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let mask = page - 1;
+    if host_addr & mask != guest_addr & mask {
+        return Err(ReclaimError::Misaligned);
+    }
+    let start = guest_addr.checked_add(mask).ok_or(ReclaimError::TooSmall)? & !mask;
+    let end = guest_addr.saturating_add(len) & !mask;
+    if end <= start {
+        return Err(ReclaimError::TooSmall);
+    }
+    let size = (end - start) as usize;
+    let hva = (host_addr + (start - guest_addr)) as *mut core::ffi::c_void;
+
+    let ret = unsafe { hv_vm_unmap(start, size) };
+    if ret != HV_SUCCESS {
+        return Err(ReclaimError::Unmap(ret));
+    }
+
+    // Same protection and flags vm-memory uses for guest RAM.
+    let fresh_anon = || {
+        let addr = unsafe {
+            libc::mmap(
+                hva,
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        addr != libc::MAP_FAILED
+    };
+    let mut fresh = false;
+    for delay in [0, 1, 10] {
+        std::thread::sleep(Duration::from_millis(delay));
+        if fresh_anon() {
+            fresh = true;
+            break;
+        }
+        warn!(
+            "reclaim: mmap(MAP_FIXED, host={hva:p}, len={size}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // hv_vm_map() succeeded for this range at boot, so it can only fail
+    // transiently, or because a failed mmap() left nothing mapped at hva.
+    // Returning with the range unmapped would leave a hole in guest RAM.
+    const BACKOFF_MS: [u64; 5] = [0, 1, 10, 100, 1000];
+    let mut attempt: u32 = 0;
+    loop {
+        let ret = unsafe { hv_vm_map(hva, start, size, guest_memory_flags()) };
+        if ret == HV_SUCCESS {
+            break;
+        }
+        attempt += 1;
+        if attempt <= 5 || attempt.is_multiple_of(60) {
+            error!(
+                "reclaim: hv_vm_map(host={hva:p}, guest=0x{start:x}, len={size}) failed: \
+                 0x{ret:x} (attempt {attempt}), retrying"
+            );
+        }
+        let delay = BACKOFF_MS[(attempt as usize).min(BACKOFF_MS.len() - 1)];
+        std::thread::sleep(Duration::from_millis(delay));
+        if !fresh && fresh_anon() {
+            fresh = true;
+        }
+    }
+    if attempt > 0 {
+        warn!("reclaim: guest=0x{start:x} len={size} mapped again after {attempt} failure(s)");
+    }
+    Ok(if fresh { size as u64 } else { 0 })
 }
 
 #[derive(Debug)]
