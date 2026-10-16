@@ -16,6 +16,11 @@ mod test_vm_pause;
 #[cfg(any(feature = "guest", target_os = "macos"))]
 use test_vm_pause::TestVmPause;
 
+#[cfg(any(feature = "guest", target_os = "macos"))]
+mod test_balloon_free_page_reclaim;
+#[cfg(any(feature = "guest", target_os = "macos"))]
+use test_balloon_free_page_reclaim::TestBalloonFreePageReclaim;
+
 mod test_acpi_smp;
 use test_acpi_smp::TestAcpiSmp;
 
@@ -139,6 +144,11 @@ pub fn test_cases() -> Vec<TestCase> {
         ),
         #[cfg(any(feature = "guest", target_os = "macos"))]
         TestCase::new("vm-pause", Box::new(TestVmPause)),
+        #[cfg(any(feature = "guest", target_os = "macos"))]
+        TestCase::new(
+            "balloon-free-page-reclaim",
+            Box::new(TestBalloonFreePageReclaim),
+        ),
         TestCase::new("acpi-smp-4cpu", Box::new(TestAcpiSmp { num_cpus: 4 })),
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         TestCase::new(
