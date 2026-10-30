@@ -91,6 +91,10 @@ mod host {
 
             TestOutcome::Pass
         }
+
+        fn timeout_secs(&self) -> u64 {
+            30
+        }
     }
 }
 
